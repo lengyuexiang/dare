@@ -1,0 +1,394 @@
+import argparse
+import random
+from numpy.linalg import inv
+from sklearn.base import BaseEstimator, TransformerMixin
+import tensorflow as tf
+import numpy as np
+import scipy as sp
+import scipy.sparse
+from time import time
+from load_data import venue_data,external_data
+import tables
+from sklearn.metrics import f1_score
+
+
+def parase_args():
+	parser = argparse.ArgumentParser(description="Run DeepFM.")
+	parser.add_argument('--dataset', nargs='?', default='vine-micro-videos',
+					help='Choose a dataset.')
+	parser.add_argument('--total_epoch', type=int, default=100,
+					help='Number of epochs.')
+	parser.add_argument('--batch_size', type=int, default=1880,
+					help='Batch size.')
+	parser.add_argument('--layers_size',nargs='?',default='[900,800,500,400]')
+
+	parser.add_argument('--learning_rate', type=float, default=0.001)
+
+	parser.add_argument('--dict_ratio', type=float, default=1)
+	parser.add_argument('--smooth_ratio', type=float, default=1)
+	parser.add_argument('--deep_ratio', type=float, default=1)
+
+	parser.add_argument('--drop_out', nargs='?', default='[0.8,0.8,0.8,0.8]',
+					help='Keep probability (1-drop_out) of each layer. 1: no dropout. ')
+	parser.add_argument('--loss_type', nargs='?', default='graph_embedding',
+					help='Specify a loss type (graph_embedding or pairwise_compare).')
+	parser.add_argument('--optimizer_type', nargs='?', default='adag',
+					help='Specify an optimizer type (adam, adag, gd, mom).')
+	parser.add_argument('--verbose', type=int, default=1,
+					help='Display the epoch result.')
+	parser.add_argument('--random_seed', type=int, default=7),
+	return parser.parse_args()
+
+
+class acoustic_model(BaseEstimator, TransformerMixin):
+	def __init__(self, train_video_num, valid_video_num, modality_dim, dict_dim, layer_unit, drop_out, loss_type, optimizer_type,
+			 learning_rate, tradeoff_ratio, class_size, random_seed, batch_size, total_epoch, loss_ratio,verbose):
+	# the list of modality dimensionality/ dictionary dimensionality.
+		self.modality_dim = modality_dim
+		self.dict_dim = dict_dim
+		self.class_size = class_size
+		self.train_video_num = train_video_num
+		self.valid_video_num = valid_video_num
+		# the list of hidden layers and corresponding dropout ratios.
+		self.layer_unit = layer_unit
+		self.drop_out = drop_out
+		# the list of tradeoff ratios, i.e., [dict_ratio, smooth_ratio, deep_ratio]
+		self.tradeoff_ratio = tradeoff_ratio
+
+		# basic experimental settings.
+		self.loss_type = loss_type
+		self.optimizer_type = optimizer_type
+		self.learning_rate = learning_rate
+		self.ratio = loss_ratio
+
+		self.random_seed = random_seed
+		self.batch_size = batch_size
+		self.total_epoch = total_epoch
+		self.verbose = verbose
+
+		self.train_pre, self.valid_pre, self.test_pre = [], [], []
+		self.train_rec, self.valid_rec, self.test_rec = [], [], []
+		self.train_auc, self.valid_auc, self.test_auc = [], [], []
+
+		self._init_graph()
+		self._valid_score()
+
+
+	def _init_graph(self):
+		self.graph = tf.Graph()
+		with self.graph.as_default():
+			tf.set_random_seed(self.random_seed)
+			# ******** MICRO-VIDEO ********
+			# Input training data with shape of (batch_size, modality dimension)
+			self.x_ids = tf.placeholder(tf.int32, shape=[self.batch_size],name='indices_batch')
+			self.x_v = tf.placeholder(tf.float32, shape=[self.batch_size, self.modality_dim[0]],name='visual_feature')
+			self.x_a = tf.placeholder(tf.float32, shape=[self.batch_size, self.modality_dim[1]],name='acoustic_feature')
+			self.x_t = tf.placeholder(tf.float32, shape=[self.batch_size, self.modality_dim[2]],name='textual_feature')
+
+			# self.y = tf.placeholder(tf.float32, shape=[None, self.class_size],name='train_label')
+			self.y = tf.placeholder(tf.int32, shape=[self.batch_size, ], name='train_label')
+			# Input validation data with shape of (batch_size, modality dimension)
+			self.valid_x_v = tf.placeholder(tf.float32, shape=[None, self.modality_dim[0]],name='valid_visual')
+			self.valid_x_a = tf.placeholder(tf.float32, shape=[None, self.modality_dim[1]],name='valid_acoustic')
+			self.valid_x_t = tf.placeholder(tf.float32, shape=[None, self.modality_dim[2]],name='valid_textual')
+
+			#  ******** EXTERNAL-AUDIO ********
+			# Input external training data with shape of (batch_size, modality dimension)
+			self.ex_x = tf.placeholder(tf.float32, shape=(None, self.modality_dim[1]),name='external_feature')
+			self.ex_y = tf.placeholder(tf.float32, shape=(None, self.dict_dim[1]),name='external_label')
+
+			self._init_weights()
+			self._init_select_embedding()
+			self._init_dictionary_loss()
+			self._init_concat()
+			self._init_smooth_loss()
+			self._init_deep_loss()
+			self._init_total_loss()
+
+			self.saver = tf.train.Saver()
+			init = tf.global_variables_initializer()
+			self.sess = tf.Session()
+			self.sess.run(init)
+
+			# number of params
+			total_parameters = 0
+			for variable in self.weights.values():
+				shape = variable.get_shape()  # shape is an array of tf.Dimension
+				variable_parameters = 1
+				for dim in shape:
+					variable_parameters *= dim.value
+				total_parameters += variable_parameters
+			if self.verbose > 0:
+				print "#params: %d" % total_parameters
+
+
+	def _init_weights(self):
+		self.weights = dict()
+		# ******** DICTIONARY ********
+		# embeddings of multi-modal dictionary atoms
+		# with shape of (dictionary dimension, modality dimension)
+		self.weights['visual_dictionary'] = tf.Variable(tf.random_normal([self.dict_dim[0], self.modality_dim[0]],
+			0., 0.1), name='visual_dictionary')
+		self.weights['acoustic_dictionary'] = tf.Variable(tf.random_normal([self.dict_dim[1], self.modality_dim[1]],
+			0., 0.1), name='acoustic_dictionary')
+		self.weights['textual_dictionary'] = tf.Variable(tf.random_normal([self.dict_dim[2], self.modality_dim[2]],
+			0., 0.1), name='textual_dictionary')
+
+		# ******** DICTIONARY EMBEDDINGS ********
+		# embeddings of multi-modal representations for all the training videos.
+		# with shape of (train_video_num, dictionary dimension)
+		# self.weights['train_visual_embeddings'] = tf.Variable(tf.random_normal([self.batch_size, self.dict_dim[0]],
+		# 	0., 0.1), name='train_visual_embeddings')
+		# self.weights['train_acoustic_embeddings'] = tf.Variable(tf.random_normal([self.batch_size, self.dict_dim[1]],
+		# 	0., 0.1), name='train_acoustic_embeddings')
+		# self.weights['train_textual_embeddings'] = tf.Variable(tf.random_normal([self.batch_size, self.dict_dim[2]],
+		# 	0., 0.1), name='train_textual_embeddings')
+
+		self.weights['train_visual_embeddings'] = tf.Variable(tf.random_normal([self.train_video_num, self.dict_dim[0]],
+			0., 0.1), name='train_visual_embeddings')
+		self.weights['train_acoustic_embeddings'] = tf.Variable(tf.random_normal([self.train_video_num, self.dict_dim[1]],
+			0., 0.1), name='train_acoustic_embeddings')
+		self.weights['train_textual_embeddings'] = tf.Variable(tf.random_normal([self.train_video_num, self.dict_dim[2]],
+			0., 0.1), name='train_textual_embeddings')
+		# ******** DEEP MULTI-MODAL FUSION ********
+		for i in range(len(self.layer_unit)):
+			if i == 0:
+				pre_layer_unit = self.dict_dim[0] + self.dict_dim[1] + self.dict_dim[2]
+			else:
+				pre_layer_unit = self.layer_unit[i-1]
+
+			glorot = np.sqrt(2. / (pre_layer_unit + self.layer_unit[i]))
+			# ..Initialize weight parameters of hidden layers.
+			self.weights['hidden_layer_%d' % i] = tf.Variable(
+				np.random.normal(loc=0., scale=glorot, size=(pre_layer_unit, self.layer_unit[i])), dtype=np.float32)
+			self.weights['hidden_bias_%d' % i] = tf.Variable(
+				np.random.normal(loc=0., scale=glorot, size=(1, self.layer_unit[i])), dtype=np.float32)
+		# ..Initialize weight parameters of prediction layers.
+		glorot = np.sqrt(2. / (self.layer_unit[-1] + 1))
+		self.weights['prediction'] = tf.Variable(
+			np.random.normal(loc=0, scale=glorot, size=(self.layer_unit[-1], self.class_size)), dtype=np.float32)
+		print('All variables initialized done.')
+
+
+	def _init_select_embedding(self):
+		self.a_v = tf.nn.embedding_lookup(self.weights['train_visual_embeddings'], self.x_ids)
+		self.a_a = tf.nn.embedding_lookup(self.weights['train_acoustic_embeddings'], self.x_ids)
+		self.a_t = tf.nn.embedding_lookup(self.weights['train_textual_embeddings'], self.x_ids)
+
+
+	def _init_dictionary_loss(self):
+		dict_loss = dict()
+		# Internal multi-modal loss.
+		dict_loss['visual'] = tf.reduce_mean(tf.square(tf.subtract(
+			self.x_v, tf.matmul(self.a_v, self.weights['visual_dictionary']))))
+		dict_loss['acoustic'] = tf.reduce_mean(tf.square(tf.subtract(
+			self.x_a, tf.matmul(self.a_a, self.weights['acoustic_dictionary']))))
+		dict_loss['textual'] = tf.reduce_mean(tf.square(tf.subtract(
+			self.x_t, tf.matmul(self.a_t, self.weights['textual_dictionary']))))
+		# External acoustic loss.
+		dict_loss['ex_acoustic'] = tf.reduce_mean(tf.square(tf.subtract(
+			self.ex_x, tf.matmul(self.ex_y, self.weights['acoustic_dictionary']))))
+		# Total.
+		self.dict_total_loss = dict_loss['visual']+ dict_loss['acoustic'] + dict_loss['textual']+ dict_loss['ex_acoustic']
+
+
+	def _init_concat(self):
+		self.a_all = tf.concat([self.a_v, self.a_a, self.a_t], 1)
+
+
+	def _init_smooth_loss(self):
+
+		self.y_one_hot = tf.one_hot(indices=self.y, depth=188, on_value=1.0, off_value=0.0)
+		inner_prod = tf.matmul(self.a_all, tf.transpose(self.a_all))
+		inner_label = tf.matmul(self.y_one_hot, tf.transpose(self.y_one_hot))
+
+		self.smooth_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=inner_label,logits=inner_prod))
+
+
+	def _init_deep_loss(self):
+		self.hidden_rep = self.a_all
+		for i in range(len(self.layer_unit)):
+			self.hidden_rep = tf.add(tf.matmul(self.hidden_rep, self.weights['hidden_layer_%d' % i]),
+				self.weights['hidden_bias_%d' % i])
+			self.hidden_rep = tf.nn.relu(self.hidden_rep)
+			self.hidden_rep = tf.nn.dropout(self.hidden_rep, self.drop_out[i])
+
+		self.predicted = tf.nn.softmax(tf.matmul(self.hidden_rep, self.weights['prediction']))
+		self.deep_loss = tf.reduce_mean(tf.nn.l2_loss(tf.subtract(self.predicted, tf.cast(self.y_one_hot,dtype=tf.float32))))
+
+
+	def _init_total_loss(self):
+		self.overall_loss = self.ratio[0]*self.dict_total_loss + self.ratio[1]*self.smooth_loss + self.ratio[2]*self.deep_loss
+
+		if self.optimizer_type == 'adam':
+			self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8).minimize(self.overall_loss)
+		elif self.optimizer_type == 'adag':
+			self.optimizer = tf.train.AdagradOptimizer(learning_rate=self.learning_rate, initial_accumulator_value=1e-8).minimize(self.overall_loss)
+		elif self.optimizer_type == 'gd':
+			self.optimizer = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(self.overall_loss)
+		elif self.optimizer_type == 'mom':
+			self.optimizer = tf.train.MomentumOptimizer(learning_rate=self.learning_rate, momentum=0.95).minimize(self.overall_loss)
+
+
+	def _valid_score(self):
+		self.valid_a_v = tf.matmul(self.valid_x_v, tf.transpose(tf.reciprocal(self.weights['visual_dictionary'])))
+		self.valid_a_a = tf.matmul(self.valid_x_a, tf.transpose(tf.reciprocal(self.weights['acoustic_dictionary'])))
+		self.valid_a_t = tf.matmul(self.valid_x_t, tf.transpose(tf.reciprocal(self.weights['textual_dictionary'])))
+
+		self.valid_a = tf.concat([self.valid_a_v, self.valid_a_a, self.valid_a_t], 1)
+		self.valid_rep = self.valid_a
+		for i in range(len(self.layer_unit)):
+			self.valid_rep = tf.add(tf.matmul(self.valid_rep, self.weights['hidden_layer_%d' % i]), self.weights['hidden_bias_%d' % i])
+			self.valid_rep = tf.nn.relu(self.valid_rep)
+
+		self.valid_predicted = tf.nn.softmax(tf.matmul(self.valid_rep, self.weights['prediction']))
+		self.valid_label = tf.argmax(self.valid_predicted, 1)
+
+		return self.valid_predicted, self.valid_label
+
+
+	def _batch_fetch(self, inner_batch, external_batch,iter):
+		batch_data = dict()
+		batch_data['x_ids'], batch_data['x_v'], batch_data['x_a'],\
+				batch_data['x_t'], batch_data['y'] = inner_batch.generate_balance_inner_data(10)
+
+		batch_data['ex_x'], batch_data['ex_y'] = external_batch._next_batch(self.batch_size,iter)
+
+		return batch_data
+
+
+	def _batch_fit(self, batch_data):
+		feed_dict = {self.x_ids: batch_data['x_ids'],
+					 self.x_v: batch_data['x_v'],
+					 self.x_a: batch_data['x_a'],
+					 self.x_t: batch_data['x_t'],
+					 self.y: batch_data['y'],
+					 self.ex_x: batch_data['ex_x'],
+					 self.ex_y: batch_data['ex_y']}
+
+		overall_loss, dict_total_loss, smooth_loss, deep_loss, batch_out = self.sess.run(
+			(self.overall_loss, self.dict_total_loss, self.smooth_loss, self.deep_loss, self.optimizer), feed_dict=feed_dict)
+
+		return overall_loss, dict_total_loss, smooth_loss, deep_loss
+
+
+	def _valid_batch_fetch(self, valid_data):
+		batch_data = dict()
+		batch_data['valid_x_v'], batch_data['valid_x_a'], batch_data['valid_x_t'] = valid_data
+
+		return batch_data
+
+	def _valid_batch_fit(self, valid_batch_data):
+		feed_dict = {self.valid_x_v: valid_batch_data['valid_x_v'],
+					 self.valid_x_a: valid_batch_data['valid_x_a'],
+					 self.valid_x_t: valid_batch_data['valid_x_t']}
+
+		valid_predicted, valid_label = self.sess.run((self.valid_predicted, self.valid_label), feed_dict=feed_dict)
+		return valid_predicted, valid_label
+
+	def _train(self, train, valid, test):
+	# Training cycle.
+
+		for epoch in range(self.total_epoch):
+			t1 = time()
+			avg_cost = 0.
+			avg_dict_loss = 0.
+			avg_smooth_loss = 0.
+			avg_deep_loss = 0.
+
+			total_batch = self.train_video_num / self.batch_size
+
+			for iter in range(total_batch):
+				train_batch_data = self._batch_fetch(train['inner'], train['external'],iter)
+				i_cost, d_cost, s_cost, de_cost = self._batch_fit(train_batch_data)
+
+				print iter, i_cost, d_cost, s_cost, de_cost
+
+				avg_cost += i_cost / total_batch
+				avg_dict_loss += d_cost / total_batch
+				avg_smooth_loss += s_cost / total_batch
+				avg_deep_loss += de_cost / total_batch
+
+
+			t2 = time()
+
+			valid_batch_data = self._valid_batch_fetch(valid['valid_x'])
+			valid_predicted, valid_label = self._valid_batch_fit(valid_batch_data)
+
+			print('the number of predict categories is %d' % np.unique(valid_label).__len__())
+			for label in np.unique(valid_label):
+				print('the number of predict label %d for each is %d' % (label, len(np.argwhere(valid_label == label))))
+
+			micro1 = f1_score(y_true=valid['valid_y'], y_pred=valid_label, average='micro')
+			macro1 = f1_score(y_true=valid['valid_y'], y_pred=valid_label, average='macro')
+
+			print(micro1)
+			print(macro1)
+
+
+def main():
+
+    ex_file = 'external_sda.h5'
+    ex_label_file = 'external_label.h5'
+
+    external_dataset = external_data(ex_file,ex_label_file)
+
+    file = 'venue_split_data.h5'
+    inner_dataset = venue_data(file)
+    valid_size = inner_dataset.get_valid_num()
+    train_num = inner_dataset.get_train_num()
+
+    train = {}
+    train['inner'] = inner_dataset
+    train['external'] = external_dataset
+
+    valid = {}
+
+    x_v, x_a, x_t, y_valid = inner_dataset.generate_valid_data()
+
+    valid['valid_x_v'] = x_v
+    valid['valid_x_a'] = x_a
+    valid['valid_x_t'] = x_t
+    valid['valid_x'] = valid['valid_x_v'],valid['valid_x_a'],valid['valid_x_t']
+    valid['valid_y'] = y_valid
+
+    test = {}
+
+    ## initialize all parameters
+    modality_num = 3
+    modality_dim = [4096, 200, 100]
+    dictionary_dim = [500, 313, 200]
+    output_num = 188
+    tradeoff_ratio = 0.01
+
+    ## read the parameters from paraser
+    args = parase_args()
+
+    epoch_num = 10
+
+    layer_num = 4
+    layers_size = [800,600,500,400]
+    loss_ratio = [1.0,1.0,0.01]
+    optimizer_type = 'adag'
+
+
+    model = acoustic_model(train_num,valid_size,modality_dim,dictionary_dim, layers_size,eval(args.drop_out),
+                           args.loss_type, optimizer_type, args.learning_rate,tradeoff_ratio,output_num,args.random_seed,
+                           args.batch_size,args.total_epoch, loss_ratio,args.verbose)
+
+    model._train(train,valid,test)
+
+    inner_dataset.close()
+    external_data._close()
+
+
+if __name__ == '__main__':
+
+    main()
+
+
+
+
+
+
+
