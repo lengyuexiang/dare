@@ -1,0 +1,407 @@
+
+import numpy as np
+import tables
+import random
+
+class venue_data(object):
+    def __init__(self,file_name):
+
+        self.name = file_name
+
+        self.f = tables.open_file(self.name, 'r')
+
+        self.X_train = self.f.root.X_train
+        self.y_train = self.f.root.y_train
+
+        self.X_valid = self.f.root.X_valid
+        self.y_valid = self.f.root.y_valid
+        self.y_valid = np.array(self.y_valid,dtype=np.int64)
+
+        self.X_test = self.f.root.X_test
+        self.y_test = self.f.root.y_test
+
+        self.generate_train_balance_indices()
+        self.generate_valid_balance_indices()
+
+    def split_feature(self, x, index):
+
+        if index == 0:
+            feature_start = 0
+            feature_end = 4096 - 1
+
+        elif index == 1:
+            feature_start = 4096
+            feature_end = 4096 + 200 - 1
+        else:
+            feature_start = 4096 + 200
+            feature_end = 4096 + 200 + 100 - 1
+
+        return x[:, feature_start:feature_end]
+
+    def split(self,x):
+        # feature_index = [0, 4095, 4096 ,4295, 4296, 4395]
+
+        # x_v = x[:,feature_index[0]:feature_index[1]]
+        # x_a = x[:, feature_index[2]:feature_index[3]]
+        # x_t = x[:, feature_index[4]:feature_index[5]]
+        feature_index = [0, 4096, 4296, 4396]
+        x_v = x[:,feature_index[0]:feature_index[1]]
+        x_a = x[:, feature_index[1]:feature_index[2]]
+        x_t = x[:, feature_index[2]:feature_index[3]]
+        return x_v,x_a,x_t
+
+    def get_train_ids(self):
+
+        return self.f.root.id_train
+
+    def get_valid_ids(self):
+
+        return self.f.root.id_valid
+
+    def get_test_ids(self):
+
+        return self.f.root.id_test
+
+    def get_train_lables(self):
+
+        return self.f.root.y_train
+
+    def get_valid_lables(self):
+
+        return self.f.root.y_valid
+
+    def get_test_lables(self):
+
+        return self.f.root.y_test
+
+    def create_one_hot_label(self,y):
+
+        num_label = len(np.unique(y))
+        num_train = y.shape[0]
+
+        temp = np.zeros((num_train, num_label),dtype=np.int8)
+
+        for i in range(num_label):
+            index = np.argwhere(y==np.int8(i))
+            index = index.ravel()
+
+            temp[index,i] = 1
+
+        print('one hot convert')
+
+        return temp
+
+    def get_train_num(self):
+
+        return self.y_train.shape[0]
+
+    def get_valid_num(self):
+
+        return self.y_valid.shape[0]
+
+    def get_train_ids(self):
+
+        count = self.get_train_num()
+
+        self.train_ids = range(count)
+
+
+    def next_batch(self,batch_size,i):
+
+        X = self.X_train[batch_size * i: batch_size * (i+1)]
+        y = self.y_train[batch_size * i: batch_size * (i+1)]
+
+        return X,y
+
+    def one_hot_next_batch(self,batch_size,i):
+
+        X = self.X_train[batch_size * i: batch_size * (i+1)]
+        y = self.y_train[batch_size * i: batch_size * (i+1)]
+
+        y = self.one_hot(y)
+
+        return X,y
+
+    def one_hot(self,y):
+
+        depth = 188
+        num = y.shape[0]
+        temp = np.zeros((num,depth),dtype=np.float32)
+        for i in range(188):
+            index = np.argwhere(y==i)
+            temp[index,i] = 1.0
+
+        return temp
+
+    def train_random_sample(self,batch_size):
+
+        self.get_train_ids()
+        sample_index = random.sample(self.train_ids, batch_size)
+
+        X = self.X_train[sample_index,:]
+        y = self.y_train[sample_index]
+
+        return sample_index, X,y
+
+    def generate_inner_data(self,batch_size):
+
+        sample_index, X, y = self.train_random_sample(batch_size)
+
+        x_v, x_a, x_t = self.split(X)
+
+        return sample_index,x_v, x_a, x_t,y
+
+    def generate_valid_data(self):
+
+        x_v, x_a, x_t = self.split(self.X_valid)
+
+        return x_v, x_a, x_t, self.y_valid
+
+    def labels_pro(self, y):
+        '''
+
+        :return: return the distribution of each labels
+        '''
+        # num = len(self.y_valid)
+        # ratios = []
+        #
+        # for i in np.unique(self.y_valid):
+        #     index = np.argwhere(self.y_valid == i)
+        #
+        #     index_num = len(index)
+        #     ratio = index_num / float(num)
+        #
+        #     ratios.append(ratio)
+        num = len(y)
+        ratios = []
+
+        for i in np.unique(y):
+            index = np.argwhere(y == i)
+
+            index_num = len(index)
+            ratio = index_num / float(num)
+
+            ratios.append(ratio)
+        ratios.sort()
+
+        print(ratios)
+
+
+    def straitfied(self,batch_size):
+        '''
+        randomly sample the training data in a batch size in each label
+        :param batch_size:
+        :return: features and corresponding labels
+
+        '''
+        X_samples = []
+        y_samples = []
+
+
+        x_dim = self.X_train.shape[1]
+        y_train = np.array(self.y_train, dtype=np.int32)
+        for i in np.unique(y_train):
+            # find the index
+            index = np.argwhere(y_train==i)
+            # get the corresponding feature, we need ravel the index into 1-d
+            x_temp = self.X_train[index.ravel(),:]
+            try:
+                sample = random.sample(x_temp, batch_size)
+
+            except:
+                print('sample error, maybe the sample size is great than the samples')
+                return  -1
+
+            X_samples.append(sample)
+            y_sample = i * np.ones((batch_size,1),dtype=np.int32)
+            y_samples.append(y_sample)
+
+
+        X_samples = np.array(X_samples, dtype = np.float32)
+        X_samples = np.reshape(X_samples,(-1,x_dim))
+        y_samples = np.array(y_samples, dtype = np.int32)
+        y_samples = np.ravel(y_samples)
+
+        return X_samples, y_samples
+
+    def generate_train_balance_indices(self):
+
+        y_train = np.array(self.y_train, dtype=np.int32)
+
+        self.indices = []
+        for i in np.unique(y_train):
+            index = np.argwhere(y_train == i)
+            index = index.ravel()
+            self.indices.append(index)
+
+    def generate_valid_balance_indices(self):
+
+        y_valid = np.array(self.y_valid, dtype=np.int32)
+
+        self.valid_indices = []
+        for i in np.unique(y_valid):
+            index = np.argwhere(y_valid == i)
+            index = index.ravel()
+            self.valid_indices.append(index)
+
+    def straitfied_train_sample(self,batch_size):
+        X_list = []
+        y_list = []
+        for i in range(self.indices.__len__()):
+            sample_index = random.sample(self.indices[i],batch_size)
+            x = self.X_train[sample_index,:]
+            y = self.y_train[sample_index]
+            X_list.append(x)
+            y_list.append(y)
+
+        X_list = np.array(X_list,dtype=np.float32)
+        X_list = X_list.reshape(batch_size * self.indices.__len__(),-1)
+        y_list = np.array(y_list,dtype=np.int32)
+        y_list = y_list.reshape(batch_size * self.indices.__len__())
+
+        return X_list,y_list
+
+    def straitfied_valid_sample(self,batch_size):
+        X_list = []
+        y_list = []
+        for i in range(self.valid_indices.__len__()):
+            sample_index = random.sample(self.valid_indices[i],batch_size)
+            x = self.X_valid[sample_index,:]
+            y = self.y_valid[sample_index]
+            X_list.append(x)
+            y_list.append(y)
+
+        X_list = np.array(X_list,dtype=np.float32)
+        X_list = X_list.reshape(batch_size * self.indices.__len__(),-1)
+        y_list = np.array(y_list,dtype=np.int32)
+        y_list = y_list.reshape(batch_size * self.indices.__len__())
+
+        return X_list,y_list
+
+    def n_hot_label(self,y):
+
+        sample_num = len(y)
+        n_hot = np.zeros((sample_num,sample_num),dtype=np.float32)
+
+        representations = []
+        for label in np.unique(y):
+            representation = np.zeros((sample_num,),dtype=np.float32)
+            index = np.argwhere(y==label)
+            representation[index] = 1
+            n_hot[index] = representation
+
+        return n_hot
+
+    def negative_sample(self,X,y,batch_size):
+
+        unique_label = np.unique(y)
+        num = y.shape[0]
+        indices = range(0,num)
+        one_hot_label = np.ones((y.shape[0],len(unique_label)),dtype=np.float32)
+        count = 0
+        for label in unique_label:
+            postive_index = np.argwhere(y!=label)
+            postive_num = len(postive_index)
+            postive_X = X[postive_index]
+            postive_y = np.ones((postive_num,),dtype=np.float32)
+
+            negative_num = postive_num
+            candidation = indices.remove(postive_index)
+            negative_index= np.random.sample(candidation,negative_num)
+            negative_X = X[negative_index]
+            negative_y = np.ones((postive_num,),dtype=np.float32) - 2.0
+
+        postive_sample = postive_X, postive_y
+        negtaive_sample = negative_X, negative_y
+
+        return postive_sample, negtaive_sample
+
+    def close(self):
+        self.f.close()
+
+class external_data(object):
+
+    def __init__(self,feat_file,label_file):
+        self.f = tables.open_file(feat_file, 'r')
+        self.ex_feature = self.f.root.features
+
+
+        self.ff = tables.open_file(label_file, 'r')
+        self.ex_label = self.ff.root.labels
+
+    def _next_batch(self,batch_size, i):
+
+        num = self.ex_feature.shape[0]
+        if batch_size * (i + 1) > num:
+
+            X, y = self._random_sample(self.ex_feature,self.ex_label,batch_size)
+        else:
+            X = self.ex_feature[batch_size * i: batch_size * (i + 1)]
+            y = self.ex_label[batch_size * i: batch_size * (i + 1)]
+
+        return X, y
+
+    def _random_sample(self,X, y, num):
+        '''
+
+        :param X: feature matrix
+        :param y: label matrix
+        :param num: the desire number of sampling
+        :return: the sampled feature and corresponding label matrix
+        '''
+        count = len(y)
+        if count < num:
+            print('the sample number is greater than the  samples')
+
+        indices = range(0, count)
+        index = random.sample(indices, num)
+
+        return X[index, :], y[index, :]
+
+    def _close(self):
+        self.f.close()
+        self.ff.close()
+
+
+def read_label():
+    file = 'leaf_labels1'
+    labels = []
+    f = open(file,'r')
+    for line in f.readlines():
+        label = line.split('::::')[1]
+        label = label.replace('\n','')
+        labels.append(label)
+
+    labels = np.array(labels, dtype=np.int32)
+    for label in np.unique(labels):
+        index = np.argwhere(labels==label)
+        print('the number of %s is %d' %(label,len(index)))
+
+    f.close()
+
+
+def get_valid_id_label():
+
+    save_file = 'valid_id_label.txt'
+    f = open(save_file, 'w')
+
+    file ='venue_split_data.h5'
+
+    data = venue_data(file)
+
+    valid_id = data.get_valid_ids()
+
+    valid_label = data.get_valid_lables()
+
+    num = valid_label.shape[0]
+    for i in range(num):
+        _id = valid_id[i]
+        label = valid_label[i]
+        print(str(_id)+'::::'+str(label)+'\n')
+        f.write(str(_id)+'::::'+str(label)+'\n')
+
+    f.close()
+
+
+if __name__ == '__main__':
+    get_valid_id_label()
